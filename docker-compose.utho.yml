@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: billsage_backend
+    env_file:
+      - ./backend/.env
+    environment:
+      APP_NAME: The Airco Billsage Backend
+      APP_VERSION: 1.0.0
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: https://billsage.theairco.ai,http://127.0.0.1:3100
+    ports:
+      - "127.0.0.1:8100:8000"
+    networks:
+      - billsage_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    volumes:
+      - ./backend/uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: https://billsage.theairco.ai
+        VITE_SUPABASE_URL: https://lqliskmaiyemyramntyp.supabase.co
+        VITE_SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxbGlza21haXllbXlyYW1udHlwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzNzMyNzQsImV4cCI6MjA4ODk0OTI3NH0.TZYJMv4j5HoaLn1k9S8OP-oh6TvMtJz1v4A2n7Xr0RU
+    container_name: billsage_frontend
+    ports:
+      - "127.0.0.1:3100:80"
+    networks:
+      - billsage_network
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+networks:
+  billsage_network:
+    driver: bridge
