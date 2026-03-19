@@ -1,5 +1,6 @@
 services:
   backend:
+    image: airco-billsage-backend:latest
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -27,6 +28,7 @@ services:
       - ./backend/uploads:/app/uploads
 
   frontend:
+    image: airco-billsage-frontend:latest
     build:
       context: ./frontend
       dockerfile: Dockerfile
