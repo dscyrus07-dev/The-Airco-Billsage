@@ -107,7 +107,11 @@ export default function RecordPaymentModal({ open, onOpenChange, invoice, onSucc
 
     try {
       const paymentData: PaymentCreateData = {
-        ...data,
+        payment_date: data.payment_date,
+        payment_mode: data.payment_mode,
+        amount: data.amount,
+        reference_number: data.reference_number,
+        notes: data.notes,
         sales_invoice_id: invoice.id,
         proof_file: selectedFile || undefined,
       };
@@ -184,7 +188,7 @@ export default function RecordPaymentModal({ open, onOpenChange, invoice, onSucc
                 value={watchedPaymentMode}
                 onValueChange={(value) => form.setValue('payment_mode', value as any)}
               >
-                <SelectTrigger className="mt-1">
+                <SelectTrigger id="payment_mode" className="mt-1">
                   <SelectValue placeholder="Select payment mode" />
                 </SelectTrigger>
                 <SelectContent>

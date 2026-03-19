@@ -5,18 +5,20 @@ Handles purchase invoices/vouchers with full CRUD operations.
 All operations use real PostgreSQL database (vouchers table).
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import date, datetime
 from decimal import Decimal
 import uuid
 import logging
 import tempfile
 import os
-from config.database import get_db
+import json
+from config.database import get_db, SessionLocal
 from dependencies.auth import get_current_user, CurrentUser
 from schemas.purchase_schemas import (
     PurchaseCreate, PurchaseUpdate, PurchaseResponse, PurchaseListResponse,
@@ -41,6 +43,476 @@ def _sanitize_upload_filename(file_name: str) -> str:
 def _build_review_file_path(review_id: str, file_name: str) -> str:
     os.makedirs(PURCHASE_UPLOAD_DIR, exist_ok=True)
     return os.path.join(PURCHASE_UPLOAD_DIR, f"{review_id}_{_sanitize_upload_filename(file_name)}")
+
+
+def _parse_json_field(value: Any, default: Any):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def _build_review_error(review_id: str, stage: str, message: str, details: str, status_code: int) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "status": "failed",
+            "stage": stage,
+            "message": message,
+            "details": details,
+            "review_id": review_id
+        }
+    )
+
+
+def _build_processing_response(review_id: str, file_name: str, file_size: int) -> Dict[str, Any]:
+    return {
+        "status": "processing",
+        "review_id": review_id,
+        "file_name": file_name,
+        "file_size": file_size,
+        "message": "Upload received. Extraction is running in the background."
+    }
+
+
+def _build_extracted_data(normalized_data: Dict[str, Any], line_items_with_matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "vendor": {
+            "name": normalized_data["supplier"].get("name"),
+            "gstin": normalized_data["supplier"].get("gstin"),
+            "address": normalized_data["supplier"].get("address"),
+            "phone": normalized_data["supplier"].get("phone"),
+            "email": normalized_data["supplier"].get("email")
+        },
+        "invoice": {
+            "invoice_number": normalized_data["invoice"].get("invoice_number"),
+            "invoice_date": normalized_data["invoice"].get("invoice_date"),
+            "due_date": normalized_data["invoice"].get("due_date"),
+            "place_of_supply": normalized_data["invoice"].get("place_of_supply")
+        },
+        "amounts": {
+            "subtotal": normalized_data["amounts"].get("subtotal", 0),
+            "cgst": normalized_data["amounts"].get("cgst_amount", 0),
+            "sgst": normalized_data["amounts"].get("sgst_amount", 0),
+            "igst": normalized_data["amounts"].get("igst_amount", 0),
+            "grand_total": normalized_data["amounts"].get("grand_total", 0)
+        },
+        "line_items": [
+            {
+                "description": item.get("description"),
+                "hsn_sac": item.get("hsn_sac_code"),
+                "quantity": item.get("quantity"),
+                "unit": item.get("unit"),
+                "rate": item.get("rate"),
+                "taxable_value": item.get("taxable_amount"),
+                "cgst": item.get("cgst_amount"),
+                "sgst": item.get("sgst_amount"),
+                "igst": item.get("igst_amount"),
+                "total_amount": item.get("line_total")
+            }
+            for item in line_items_with_matches
+        ]
+    }
+
+
+def _build_review_response(
+    review_id: str,
+    workflow_status: str,
+    overall_confidence: float,
+    extracted_data: Dict[str, Any],
+    supplier_match: Dict[str, Any],
+    validation: Dict[str, Any],
+    matching_warnings: List[str],
+    file_name: str,
+    file_size: int,
+    ocr_result: Dict[str, Any],
+    full_text: str,
+    line_items_with_matches: List[Dict[str, Any]],
+    matching_failed: bool
+) -> Dict[str, Any]:
+    response = {
+        "status": workflow_status,
+        "review_id": review_id,
+        "extraction_confidence": overall_confidence,
+        "extracted_data": extracted_data,
+        "supplier_match": supplier_match,
+        "normalization_warnings": validation.get("warnings", []),
+        "normalization_errors": validation.get("errors", []),
+        "matching_warnings": matching_warnings,
+        "file_name": file_name,
+        "file_size": file_size,
+        "processing_metadata": {
+            "ocr_confidence": float(ocr_result.get("avg_confidence", 0)),
+            "llm_confidence": 0,
+            "ocr_pages": ocr_result.get("total_pages", 1),
+            "text_length": len(full_text),
+            "supplier_matched": supplier_match.get("matched", False),
+            "products_matched": sum(1 for i in line_items_with_matches if i.get("product_match", {}).get("matched", False)),
+            "total_items": len(line_items_with_matches),
+            "matching_failed": matching_failed
+        },
+        "created_at": datetime.now().isoformat()
+    }
+    if workflow_status == "needs_vendor_review" and supplier_match.get("prefill_party"):
+        response["prefill_party"] = supplier_match["prefill_party"]
+        response["message"] = "New vendor found - please review and create supplier"
+    elif workflow_status == "completed":
+        response["message"] = "Extraction completed successfully"
+    return response
+
+
+def _create_pending_extraction_review(
+    db: Session,
+    review_id: str,
+    company_id: str,
+    uploaded_by: str,
+    file_name: str,
+    file_size: int
+) -> None:
+    review_query = text("""
+        INSERT INTO extraction_reviews (
+            id, company_id, file_name, file_size, uploaded_by,
+            extracted_data, normalized_data, supplier_match_data,
+            normalization_warnings, normalization_errors, matching_warnings,
+            status, uploaded_at, created_at, updated_at
+        ) VALUES (
+            :id, :company_id, :file_name, :file_size, :uploaded_by,
+            :extracted_data, :normalized_data, :supplier_match_data,
+            :normalization_warnings, :normalization_errors, :matching_warnings,
+            'pending', NOW(), NOW(), NOW()
+        )
+    """)
+
+    db.execute(review_query, {
+        "id": review_id,
+        "company_id": company_id,
+        "file_name": file_name,
+        "file_size": file_size,
+        "uploaded_by": uploaded_by,
+        "extracted_data": json.dumps({}),
+        "normalized_data": json.dumps({}),
+        "supplier_match_data": json.dumps({}),
+        "normalization_warnings": json.dumps([]),
+        "normalization_errors": json.dumps([]),
+        "matching_warnings": json.dumps([])
+    })
+
+
+def _update_extraction_review_success(
+    db: Session,
+    review_id: str,
+    response: Dict[str, Any],
+    normalized_data: Dict[str, Any]
+) -> None:
+    processing_metadata = response.get("processing_metadata", {})
+    review_query = text("""
+        UPDATE extraction_reviews
+        SET ocr_confidence = :ocr_confidence,
+            llm_confidence = :llm_confidence,
+            overall_confidence = :overall_confidence,
+            ocr_pages = :ocr_pages,
+            text_length = :text_length,
+            extracted_data = :extracted_data,
+            normalized_data = :normalized_data,
+            supplier_matched = :supplier_matched,
+            supplier_match_data = :supplier_match_data,
+            products_matched = :products_matched,
+            total_items = :total_items,
+            matching_failed = :matching_failed,
+            normalization_warnings = :normalization_warnings,
+            normalization_errors = :normalization_errors,
+            matching_warnings = :matching_warnings,
+            status = :status,
+            updated_at = NOW()
+        WHERE id = :id
+    """)
+
+    db.execute(review_query, {
+        "id": review_id,
+        "ocr_confidence": float(processing_metadata.get("ocr_confidence", 0)),
+        "llm_confidence": float(processing_metadata.get("llm_confidence", 0)),
+        "overall_confidence": float(response.get("extraction_confidence", 0)),
+        "ocr_pages": processing_metadata.get("ocr_pages", 1),
+        "text_length": processing_metadata.get("text_length", 0),
+        "extracted_data": json.dumps(response.get("extracted_data", {})),
+        "normalized_data": json.dumps(normalized_data),
+        "supplier_matched": response.get("supplier_match", {}).get("matched", False),
+        "supplier_match_data": json.dumps(response.get("supplier_match", {})),
+        "products_matched": processing_metadata.get("products_matched", 0),
+        "total_items": processing_metadata.get("total_items", 0),
+        "matching_failed": processing_metadata.get("matching_failed", False),
+        "normalization_warnings": json.dumps(response.get("normalization_warnings", [])),
+        "normalization_errors": json.dumps(response.get("normalization_errors", [])),
+        "matching_warnings": json.dumps(response.get("matching_warnings", [])),
+        "status": response.get("status", "completed")
+    })
+
+
+def _update_extraction_review_failure(db: Session, review_id: str, error_payload: Dict[str, Any]) -> None:
+    review_query = text("""
+        UPDATE extraction_reviews
+        SET extracted_data = :extracted_data,
+            normalized_data = :normalized_data,
+            normalization_warnings = :normalization_warnings,
+            normalization_errors = :normalization_errors,
+            matching_warnings = :matching_warnings,
+            status = 'failed',
+            updated_at = NOW()
+        WHERE id = :id
+    """)
+
+    db.execute(review_query, {
+        "id": review_id,
+        "extracted_data": json.dumps({}),
+        "normalized_data": json.dumps({"_error": error_payload}),
+        "normalization_warnings": json.dumps([]),
+        "normalization_errors": json.dumps([f"{error_payload.get('stage', 'unknown')}: {error_payload.get('message', 'Extraction failed')}"]),
+        "matching_warnings": json.dumps([error_payload.get("details")]) if error_payload.get("details") else json.dumps([])
+    })
+
+
+def _process_purchase_upload_async(
+    review_id: str,
+    company_id: str,
+    uploaded_by: str,
+    file_name: str,
+    file_content: bytes,
+    file_type: str
+) -> None:
+    db = SessionLocal()
+    current_stage = "initialization"
+
+    try:
+        logger.info(f"[{review_id}] Background extraction started for file: {file_name}")
+
+        current_stage = "ocr_extraction"
+        logger.info(f"[{review_id}] Step 1: Running OCR extraction...")
+        ocr_service = get_ocr_service(languages=['en'])
+
+        try:
+            ocr_result = ocr_service.extract_text_from_file(
+                file_bytes=file_content,
+                file_type=file_type,
+                preprocess=True
+            )
+
+            full_text = ocr_result["full_text"]
+            ocr_confidence = float(ocr_result["avg_confidence"])
+
+            logger.info(f"[{review_id}] OCR completed: {len(full_text)} chars, {ocr_confidence:.2%} confidence")
+
+            if not full_text or len(full_text.strip()) < 50:
+                raise _build_review_error(
+                    review_id,
+                    "ocr_extraction",
+                    "Could not extract sufficient text from document",
+                    "The file may be unreadable, contain only images, or be a scanned document without text layer.",
+                    status.HTTP_422_UNPROCESSABLE_ENTITY
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[{review_id}] OCR extraction failed: {e}", exc_info=True)
+            error_message = str(e)
+            if "OCR dependencies are not installed" in error_message:
+                raise _build_review_error(
+                    review_id,
+                    "ocr_extraction",
+                    "OCR service is not configured on the backend",
+                    error_message,
+                    status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            raise _build_review_error(
+                review_id,
+                "ocr_extraction",
+                "Could not extract text from the document",
+                "Please ensure it's a valid PDF with readable text.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        current_stage = "llm_extraction"
+        logger.info(f"[{review_id}] Step 2: Running LLM extraction...")
+
+        try:
+            from services.llm_extraction_service import LLMConfigurationError, LLMProviderError
+
+            llm_service = get_llm_extraction_service()
+            llm_result = llm_service.extract_purchase_data(full_text)
+
+            raw_extracted_data = llm_result["extracted_data"]
+            llm_confidence = float(llm_result["confidence"])
+
+            logger.info(f"[{review_id}] LLM extraction completed: {llm_confidence:.2%} confidence")
+        except LLMConfigurationError as e:
+            raise _build_review_error(
+                review_id,
+                "llm_extraction",
+                "LLM service is not properly configured",
+                str(e),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        except LLMProviderError as e:
+            logger.error(f"[{review_id}] LLM provider error: {e}")
+            if e.status_code == 400:
+                raise _build_review_error(review_id, "llm_extraction", "Invalid model configuration", f"The configured LLM model is not valid. {str(e)}", status.HTTP_502_BAD_GATEWAY)
+            if e.status_code in {401, 403}:
+                raise _build_review_error(review_id, "llm_extraction", "LLM API key is invalid or unauthorized", str(e), status.HTTP_500_INTERNAL_SERVER_ERROR)
+            if e.status_code == 502:
+                raise _build_review_error(review_id, "llm_extraction", "Failed to connect to LLM service", str(e), status.HTTP_502_BAD_GATEWAY)
+            raise _build_review_error(review_id, "llm_extraction", "LLM service error", str(e), status.HTTP_502_BAD_GATEWAY)
+        except LLMResponseError as e:
+            raise _build_review_error(
+                review_id,
+                "llm_extraction",
+                "LLM returned invalid or empty response",
+                str(e),
+                status.HTTP_502_BAD_GATEWAY
+            )
+        except ValueError:
+            raise _build_review_error(
+                review_id,
+                "llm_extraction",
+                "Could not parse structured data from the document",
+                "The LLM returned invalid data. The document format may be unsupported.",
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[{review_id}] Unexpected LLM error: {e}", exc_info=True)
+            raise _build_review_error(
+                review_id,
+                "llm_extraction",
+                "An unexpected error occurred during LLM extraction",
+                "Please try again or contact support if the issue persists.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        current_stage = "normalization"
+        logger.info(f"[{review_id}] Step 3: Normalizing extracted data...")
+
+        try:
+            normalizer = get_purchase_normalizer()
+            normalized_data = normalizer.normalize_purchase_data(raw_extracted_data)
+            validation = normalized_data.get("_validation", {})
+
+            logger.info(
+                f"[{review_id}] Normalization completed: {len(validation.get('warnings', []))} warnings, "
+                f"{len(validation.get('errors', []))} errors"
+            )
+        except Exception as e:
+            logger.error(f"[{review_id}] Normalization failed: {e}", exc_info=True)
+            raise _build_review_error(
+                review_id,
+                "normalization",
+                "Could not normalize the extracted data",
+                "The document format may be invalid or unsupported.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        current_stage = "matching"
+        logger.info(f"[{review_id}] Step 4: Matching supplier and products...")
+
+        matching_warnings: List[str] = []
+        matching_failed = False
+
+        try:
+            matching_service = get_matching_service(db, company_id)
+            supplier_match = matching_service.match_supplier(normalized_data.get("supplier", {}))
+
+            line_items_with_matches = []
+            for item in normalized_data.get("line_items", []):
+                product_match = matching_service.match_product(item)
+                item_with_match = {
+                    **item,
+                    "product_match": product_match
+                }
+                line_items_with_matches.append(item_with_match)
+
+            logger.info(
+                f"[{review_id}] Matching completed: Supplier matched={supplier_match['matched']}, "
+                f"Products matched={sum(1 for i in line_items_with_matches if i['product_match']['matched'])}/{len(line_items_with_matches)}"
+            )
+        except Exception as e:
+            logger.error(f"[{review_id}] Matching stage failed with error: {e}", exc_info=True)
+            matching_failed = True
+            matching_warnings.append(f"Matching stage failed: {str(e)}")
+            supplier_match = {"matched": False}
+            line_items_with_matches = normalized_data.get("line_items", [])
+
+        overall_confidence = (ocr_confidence + llm_confidence) / 2
+        workflow_status = "completed"
+        if not matching_failed and supplier_match.get("requires_creation"):
+            workflow_status = "needs_vendor_review"
+            logger.info(f"[{review_id}] New vendor found - requires user review and creation")
+        elif matching_failed:
+            logger.warning(f"[{review_id}] Upload completed with warnings: matching stage failed")
+        else:
+            logger.info(f"[{review_id}] All stages completed successfully")
+
+        extracted_data = _build_extracted_data(normalized_data, line_items_with_matches)
+        response = _build_review_response(
+            review_id=review_id,
+            workflow_status=workflow_status,
+            overall_confidence=overall_confidence,
+            extracted_data=extracted_data,
+            supplier_match=supplier_match,
+            validation=validation,
+            matching_warnings=matching_warnings,
+            file_name=file_name,
+            file_size=len(file_content),
+            ocr_result=ocr_result,
+            full_text=full_text,
+            line_items_with_matches=line_items_with_matches,
+            matching_failed=matching_failed
+        )
+        response["processing_metadata"]["llm_confidence"] = llm_confidence
+
+        _update_extraction_review_success(db, review_id, response, normalized_data)
+        db.commit()
+
+        logger.info(f"[{review_id}] Background extraction finished successfully")
+    except HTTPException as exc:
+        db.rollback()
+        error_payload = exc.detail if isinstance(exc.detail, dict) else {
+            "status": "failed",
+            "stage": current_stage,
+            "message": "Document processing failed",
+            "details": str(exc.detail),
+            "review_id": review_id
+        }
+
+        try:
+            _update_extraction_review_failure(db, review_id, error_payload)
+            db.commit()
+        except Exception as update_error:
+            db.rollback()
+            logger.error(f"[{review_id}] Failed to persist extraction failure state: {update_error}", exc_info=True)
+
+        logger.error(f"[{review_id}] Background extraction failed at stage '{current_stage}': {error_payload}")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[{review_id}] Background upload pipeline error at stage '{current_stage}': {e}", exc_info=True)
+        error_payload = {
+            "status": "failed",
+            "stage": current_stage,
+            "message": "An unexpected error occurred during document processing",
+            "details": "Please try again or contact support if the issue persists.",
+            "review_id": review_id
+        }
+
+        try:
+            _update_extraction_review_failure(db, review_id, error_payload)
+            db.commit()
+        except Exception as update_error:
+            db.rollback()
+            logger.error(f"[{review_id}] Failed to persist unexpected extraction error state: {update_error}", exc_info=True)
+    finally:
+        db.close()
 
 
 def _get_original_bill_metadata(db: Session, purchase_id: str, company_id: str):
@@ -541,7 +1013,7 @@ async def download_purchase_bill(
 
     purchase = await get_purchase(purchase_id, current_user, db)
     return JSONResponse(
-        content=purchase,
+        content=jsonable_encoder(purchase),
         headers={
             "Content-Disposition": f'attachment; filename="purchase-{purchase_id}.json"'
         },
@@ -957,422 +1429,90 @@ async def get_purchase_analytics(
 
 @router.post("/upload")
 async def upload_and_extract_bill(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Upload bill and extract data via OCR + LLM pipeline"""
+    """Upload bill and queue OCR + LLM extraction in the background."""
     review_id = str(uuid.uuid4())
     current_stage = "initialization"
     try:
         logger.info(f"[{review_id}] Starting upload pipeline for file: {file.filename}")
+        original_file_name = file.filename or "bill.pdf"
         
         # Validate file type
         current_stage = "validation"
         if not file.content_type or not file.content_type.startswith('application/pdf'):
             logger.warning(f"[{review_id}] Invalid file type: {file.content_type}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "status": "failed",
-                    "stage": "validation",
-                    "message": "Only PDF files are supported",
-                    "details": f"Received file type: {file.content_type}",
-                    "review_id": review_id
-                }
+            raise _build_review_error(
+                review_id,
+                "validation",
+                "Only PDF files are supported",
+                f"Received file type: {file.content_type}",
+                status.HTTP_400_BAD_REQUEST
             )
         
         # Validate file size (10MB limit)
         content = await file.read()
         if len(content) > 10 * 1024 * 1024:
             logger.warning(f"[{review_id}] File too large: {len(content)} bytes")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "status": "failed",
-                    "stage": "validation",
-                    "message": "File size must be less than 10MB",
-                    "details": f"File size: {len(content) / 1024 / 1024:.2f}MB",
-                    "review_id": review_id
-                }
+            raise _build_review_error(
+                review_id,
+                "validation",
+                "File size must be less than 10MB",
+                f"File size: {len(content) / 1024 / 1024:.2f}MB",
+                status.HTTP_400_BAD_REQUEST
             )
         
-        stored_file_path = _build_review_file_path(review_id, file.filename or "bill.pdf")
-        with open(stored_file_path, "wb") as stored_file:
-            stored_file.write(content)
-
-        # STEP 1: OCR Extraction
-        current_stage = "ocr_extraction"
-        logger.info(f"[{review_id}] Step 1: Running OCR extraction...")
-        ocr_service = get_ocr_service(languages=['en'])
-        
+        stored_file_path = _build_review_file_path(review_id, original_file_name)
         try:
-            ocr_result = ocr_service.extract_text_from_file(
-                file_bytes=content,
-                file_type=file.content_type,
-                preprocess=True
+            with open(stored_file_path, "wb") as stored_file:
+                stored_file.write(content)
+        except PermissionError as e:
+            logger.error(f"[{review_id}] Storage permission error while saving upload: {e}", exc_info=True)
+            raise _build_review_error(
+                review_id,
+                "validation",
+                "Backend storage path is not writable",
+                f"The server could not save the uploaded file to {stored_file_path}.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-            
-            full_text = ocr_result['full_text']
-            ocr_confidence = ocr_result['avg_confidence']
-            
-            logger.info(f"[{review_id}] OCR completed: {len(full_text)} chars, {ocr_confidence:.2%} confidence")
-            
-            if not full_text or len(full_text.strip()) < 50:
-                logger.warning(f"[{review_id}] Insufficient text extracted: {len(full_text)} chars")
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={
-                        "status": "failed",
-                        "stage": "ocr_extraction",
-                        "message": "Could not extract sufficient text from document",
-                        "details": "The file may be unreadable, contain only images, or be a scanned document without text layer.",
-                        "review_id": review_id
-                    }
-                )
-                
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"[{review_id}] OCR extraction failed: {e}", exc_info=True)
-            error_message = str(e)
-            if "OCR dependencies are not installed" in error_message:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail={
-                        "status": "failed",
-                        "stage": "ocr_extraction",
-                        "message": "OCR service is not configured on the backend",
-                        "details": error_message,
-                        "review_id": review_id
-                    }
-                )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "status": "failed",
-                    "stage": "ocr_extraction",
-                    "message": "Could not extract text from the document",
-                    "details": "Please ensure it's a valid PDF with readable text.",
-                    "review_id": review_id
-                }
-            )
-        
-        # STEP 2: LLM Extraction
-        current_stage = "llm_extraction"
-        logger.info(f"[{review_id}] Step 2: Running LLM extraction...")
-        
-        try:
-            from services.llm_extraction_service import LLMConfigurationError, LLMProviderError
-            
-            llm_service = get_llm_extraction_service()
-            llm_result = llm_service.extract_purchase_data(full_text)
-            
-            raw_extracted_data = llm_result['extracted_data']
-            llm_confidence = llm_result['confidence']
-            
-            logger.info(f"[{review_id}] LLM extraction completed: {llm_confidence:.2%} confidence")
-            
-        except LLMConfigurationError as e:
-            logger.error(f"[{review_id}] LLM configuration error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "status": "failed",
-                    "stage": "llm_extraction",
-                    "message": "LLM service is not properly configured",
-                    "details": str(e),
-                    "review_id": review_id
-                }
-            )
-            
-        except LLMProviderError as e:
-            logger.error(f"[{review_id}] LLM provider error: {e}")
-            
-            # Determine appropriate HTTP status based on provider error
-            if e.status_code == 400:
-                http_status = status.HTTP_502_BAD_GATEWAY
-                message = "Invalid model configuration"
-                details = f"The configured LLM model is not valid. {str(e)}"
-            elif e.status_code in {401, 403}:
-                http_status = status.HTTP_500_INTERNAL_SERVER_ERROR
-                message = "LLM API key is invalid or unauthorized"
-                details = str(e)
-            elif e.status_code == 502:
-                http_status = status.HTTP_502_BAD_GATEWAY
-                message = "Failed to connect to LLM service"
-                details = str(e)
-            else:
-                http_status = status.HTTP_502_BAD_GATEWAY
-                message = "LLM service error"
-                details = str(e)
-            
-            raise HTTPException(
-                status_code=http_status,
-                detail={
-                    "status": "failed",
-                    "stage": "llm_extraction",
-                    "message": message,
-                    "details": details,
-                    "review_id": review_id
-                }
-            )
-            
-        except LLMResponseError as e:
-            logger.error(f"[{review_id}] LLM response error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "status": "failed",
-                    "stage": "llm_extraction",
-                    "message": "LLM returned invalid or empty response",
-                    "details": str(e),
-                    "review_id": review_id
-                }
-            )
-        
-        except ValueError as e:
-            logger.error(f"[{review_id}] LLM response parsing failed: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={
-                    "status": "failed",
-                    "stage": "llm_extraction",
-                    "message": "Could not parse structured data from the document",
-                    "details": "The LLM returned invalid data. The document format may be unsupported.",
-                    "review_id": review_id
-                }
-            )
-            
-        except Exception as e:
-            logger.error(f"[{review_id}] Unexpected LLM error: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "status": "failed",
-                    "stage": "llm_extraction",
-                    "message": "An unexpected error occurred during LLM extraction",
-                    "details": "Please try again or contact support if the issue persists.",
-                    "review_id": review_id
-                }
-            )
-        
-        # STEP 3: Normalization
-        current_stage = "normalization"
-        logger.info(f"[{review_id}] Step 3: Normalizing extracted data...")
-        
-        try:
-            normalizer = get_purchase_normalizer()
-            normalized_data = normalizer.normalize_purchase_data(raw_extracted_data)
-            
-            validation = normalized_data.get('_validation', {})
-            logger.info(
-                f"[{review_id}] Normalization completed: {len(validation.get('warnings', []))} warnings, "
-                f"{len(validation.get('errors', []))} errors"
-            )
-            
-        except Exception as e:
-            logger.error(f"[{review_id}] Normalization failed: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "status": "failed",
-                    "stage": "normalization",
-                    "message": "Could not normalize the extracted data",
-                    "details": "The document format may be invalid or unsupported.",
-                    "review_id": review_id
-                }
-            )
-        
-        # STEP 4: Supplier and Product Matching
-        current_stage = "matching"
-        logger.info(f"[{review_id}] Step 4: Matching supplier and products...")
-        
-        matching_warnings = []
-        matching_failed = False
-        
-        try:
-            matching_service = get_matching_service(db, str(current_user.company_id))
-            
-            # Match supplier
-            supplier_match = matching_service.match_supplier(
-                normalized_data.get('supplier', {})
-            )
-            
-            # Match products for each line item
-            line_items_with_matches = []
-            for item in normalized_data.get('line_items', []):
-                product_match = matching_service.match_product(item)
-                item_with_match = {
-                    **item,
-                    'product_match': product_match
-                }
-                line_items_with_matches.append(item_with_match)
-            
-            logger.info(
-                f"[{review_id}] Matching completed: Supplier matched={supplier_match['matched']}, "
-                f"Products matched={sum(1 for i in line_items_with_matches if i['product_match']['matched'])}/{len(line_items_with_matches)}"
-            )
-            
-        except Exception as e:
-            logger.error(f"[{review_id}] Matching stage failed with error: {e}", exc_info=True)
-            matching_failed = True
-            matching_warnings.append(f"Matching stage failed: {str(e)}")
-            # Continue without matching - matching is non-blocking enrichment
-            supplier_match = {'matched': False}
-            line_items_with_matches = normalized_data.get('line_items', [])
-        
-        # STEP 5: Persist extraction review to database
         current_stage = "persistence"
-        overall_confidence = (ocr_confidence + llm_confidence) / 2
-        
-        # Determine workflow status based on supplier matching
-        workflow_status = 'completed'
-        if not matching_failed and supplier_match.get('requires_creation'):
-            workflow_status = 'needs_vendor_review'
-            logger.info(f"[{review_id}] New vendor found - requires user review and creation")
-        elif matching_failed:
-            logger.warning(f"[{review_id}] Upload completed with warnings: matching stage failed")
-        else:
-            logger.info(f"[{review_id}] All stages completed successfully")
-        
-        logger.info(f"[{review_id}] Step 5: Persisting extraction review to database...")
-        
-        # Prepare frontend-compatible extracted data
-        extracted_data = {
-            'vendor': {
-                'name': normalized_data['supplier'].get('name'),
-                'gstin': normalized_data['supplier'].get('gstin'),
-                'address': normalized_data['supplier'].get('address'),
-                'phone': normalized_data['supplier'].get('phone'),
-                'email': normalized_data['supplier'].get('email')
-            },
-            'invoice': {
-                'invoice_number': normalized_data['invoice'].get('invoice_number'),
-                'invoice_date': normalized_data['invoice'].get('invoice_date'),
-                'due_date': normalized_data['invoice'].get('due_date'),
-                'place_of_supply': normalized_data['invoice'].get('place_of_supply')
-            },
-            'amounts': {
-                'subtotal': normalized_data['amounts'].get('subtotal', 0),
-                'cgst': normalized_data['amounts'].get('cgst_amount', 0),
-                'sgst': normalized_data['amounts'].get('sgst_amount', 0),
-                'igst': normalized_data['amounts'].get('igst_amount', 0),
-                'grand_total': normalized_data['amounts'].get('grand_total', 0)
-            },
-            'line_items': [
-                {
-                    'description': item.get('description'),
-                    'hsn_sac': item.get('hsn_sac_code'),
-                    'quantity': item.get('quantity'),
-                    'unit': item.get('unit'),
-                    'rate': item.get('rate'),
-                    'taxable_value': item.get('taxable_amount'),
-                    'cgst': item.get('cgst_amount'),
-                    'sgst': item.get('sgst_amount'),
-                    'igst': item.get('igst_amount'),
-                    'total_amount': item.get('line_total')
-                }
-                for item in line_items_with_matches
-            ]
-        }
-        
-        response = {
-            'status': workflow_status,
-            'review_id': review_id,
-            'extraction_confidence': overall_confidence,
-            'extracted_data': extracted_data,
-            'supplier_match': supplier_match,
-            'normalization_warnings': validation.get('warnings', []),
-            'normalization_errors': validation.get('errors', []),
-            'matching_warnings': matching_warnings,
-            'file_name': file.filename,
-            'file_size': len(content),
-            'processing_metadata': {
-                'ocr_confidence': ocr_confidence,
-                'llm_confidence': llm_confidence,
-                'ocr_pages': ocr_result.get('total_pages', 1),
-                'text_length': len(full_text),
-                'supplier_matched': supplier_match['matched'],
-                'products_matched': sum(1 for i in line_items_with_matches if i.get('product_match', {}).get('matched', False)),
-                'total_items': len(line_items_with_matches),
-                'matching_failed': matching_failed
-            },
-            'created_at': datetime.now().isoformat()
-        }
-        
-        # Add prefill_party data if new vendor needs to be created
-        if workflow_status == 'needs_vendor_review' and supplier_match.get('prefill_party'):
-            response['prefill_party'] = supplier_match['prefill_party']
-            response['message'] = 'New vendor found - please review and create supplier'
-        
-        # Persist extraction review to database
         try:
-            from sqlalchemy import text
-            import json
-            
-            review_query = text("""
-                INSERT INTO extraction_reviews (
-                    id, company_id, file_name, file_size, uploaded_by,
-                    ocr_confidence, llm_confidence, overall_confidence,
-                    ocr_pages, text_length,
-                    extracted_data, normalized_data,
-                    supplier_matched, supplier_match_data,
-                    products_matched, total_items, matching_failed,
-                    normalization_warnings, normalization_errors, matching_warnings,
-                    status, uploaded_at, created_at, updated_at
-                ) VALUES (
-                    :id, :company_id, :file_name, :file_size, :uploaded_by,
-                    :ocr_confidence, :llm_confidence, :overall_confidence,
-                    :ocr_pages, :text_length,
-                    :extracted_data, :normalized_data,
-                    :supplier_matched, :supplier_match_data,
-                    :products_matched, :total_items, :matching_failed,
-                    :normalization_warnings, :normalization_errors, :matching_warnings,
-                    :status, NOW(), NOW(), NOW()
-                )
-                RETURNING id, created_at
-            """)
-            
-            review_result = db.execute(review_query, {
-                "id": review_id,
-                "company_id": str(current_user.company_id),
-                "file_name": file.filename,
-                "file_size": len(content),
-                "uploaded_by": str(current_user.user_id),
-                "ocr_confidence": float(ocr_confidence),
-                "llm_confidence": float(llm_confidence),
-                "overall_confidence": float(overall_confidence),
-                "ocr_pages": ocr_result.get('total_pages', 1),
-                "text_length": len(full_text),
-                "extracted_data": json.dumps(extracted_data),
-                "normalized_data": json.dumps(normalized_data),
-                "supplier_matched": supplier_match['matched'],
-                "supplier_match_data": json.dumps(supplier_match),
-                "products_matched": sum(1 for i in line_items_with_matches if i.get('product_match', {}).get('matched', False)),
-                "total_items": len(line_items_with_matches),
-                "matching_failed": matching_failed,
-                "normalization_warnings": json.dumps(validation.get('warnings', [])),
-                "normalization_errors": json.dumps(validation.get('errors', [])),
-                "matching_warnings": json.dumps(matching_warnings),
-                "status": workflow_status
-            }).fetchone()
-            
+            _create_pending_extraction_review(
+                db,
+                review_id=review_id,
+                company_id=str(current_user.company_id),
+                uploaded_by=str(current_user.user_id),
+                file_name=original_file_name,
+                file_size=len(content)
+            )
             db.commit()
-            
-            logger.info(f"[{review_id}] Extraction review saved to database successfully")
-            logger.info(f"[{review_id}] Upload pipeline completed - review ready for user action")
-            
         except Exception as e:
-            logger.error(f"[{review_id}] Failed to persist extraction review: {e}", exc_info=True)
+            logger.error(f"[{review_id}] Failed to create pending extraction review: {e}", exc_info=True)
             db.rollback()
-            # Don't fail the entire upload if persistence fails - return the data anyway
-            logger.warning(f"[{review_id}] Continuing without database persistence")
-        
-        # Return 200 OK for review creation (not 201 Created - no purchase created yet)
+            raise _build_review_error(
+                review_id,
+                "persistence",
+                "Could not queue the uploaded document for extraction",
+                "Please try again or contact support if the issue persists.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        background_tasks.add_task(
+            _process_purchase_upload_async,
+            review_id,
+            str(current_user.company_id),
+            str(current_user.user_id),
+            original_file_name,
+            content,
+            file.content_type or "application/pdf"
+        )
+
         return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content=response
+            status_code=status.HTTP_202_ACCEPTED,
+            content=_build_processing_response(review_id, original_file_name, len(content))
         )
         
     except HTTPException:
@@ -1487,8 +1627,6 @@ async def get_extraction_review(
 ):
     """Get extraction review by ID with full data"""
     try:
-        import json
-        
         query = text("""
             SELECT 
                 id, company_id, file_name, file_size, uploaded_by,
@@ -1518,28 +1656,58 @@ async def get_extraction_review(
                 detail="Extraction review not found"
             )
         
+        extracted_data = _parse_json_field(result.extracted_data, {})
+        normalized_data = _parse_json_field(result.normalized_data, {})
+        supplier_match_data = _parse_json_field(result.supplier_match_data, {})
+        normalization_warnings = _parse_json_field(result.normalization_warnings, [])
+        normalization_errors = _parse_json_field(result.normalization_errors, [])
+        matching_warnings = _parse_json_field(result.matching_warnings, [])
+        error_payload = normalized_data.get("_error", {}) if isinstance(normalized_data, dict) else {}
+
         # Parse JSONB fields
         review = {
             "id": str(result.id),
+            "review_id": str(result.id),
             "file_name": result.file_name,
             "file_size": result.file_size,
             "uploaded_by": str(result.uploaded_by),
             "ocr_confidence": float(result.ocr_confidence) if result.ocr_confidence else None,
             "llm_confidence": float(result.llm_confidence) if result.llm_confidence else None,
             "overall_confidence": float(result.overall_confidence) if result.overall_confidence else None,
+            "extraction_confidence": float(result.overall_confidence) if result.overall_confidence else None,
             "ocr_pages": result.ocr_pages,
             "text_length": result.text_length,
-            "extracted_data": json.loads(result.extracted_data) if result.extracted_data else None,
-            "normalized_data": json.loads(result.normalized_data) if result.normalized_data else None,
+            "extracted_data": extracted_data,
+            "normalized_data": normalized_data,
             "supplier_matched": result.supplier_matched,
-            "supplier_match_data": json.loads(result.supplier_match_data) if result.supplier_match_data else None,
+            "supplier_match": supplier_match_data,
+            "supplier_match_data": supplier_match_data,
+            "prefill_party": supplier_match_data.get("prefill_party") if isinstance(supplier_match_data, dict) else None,
             "products_matched": result.products_matched,
             "total_items": result.total_items,
             "matching_failed": result.matching_failed,
-            "normalization_warnings": json.loads(result.normalization_warnings) if result.normalization_warnings else [],
-            "normalization_errors": json.loads(result.normalization_errors) if result.normalization_errors else [],
-            "matching_warnings": json.loads(result.matching_warnings) if result.matching_warnings else [],
+            "normalization_warnings": normalization_warnings,
+            "normalization_errors": normalization_errors,
+            "matching_warnings": matching_warnings,
             "status": result.status,
+            "message": error_payload.get("message") if result.status == "failed" else (
+                "Extraction is running in the background." if result.status == "pending" else (
+                    "New vendor found - please review and create supplier" if result.status == "needs_vendor_review" else "Extraction completed successfully"
+                )
+            ),
+            "error": error_payload.get("message") if result.status == "failed" else None,
+            "error_stage": error_payload.get("stage") if result.status == "failed" else None,
+            "error_details": error_payload.get("details") if result.status == "failed" else None,
+            "processing_metadata": {
+                "ocr_confidence": float(result.ocr_confidence) if result.ocr_confidence else None,
+                "llm_confidence": float(result.llm_confidence) if result.llm_confidence else None,
+                "ocr_pages": result.ocr_pages,
+                "text_length": result.text_length,
+                "supplier_matched": result.supplier_matched,
+                "products_matched": result.products_matched,
+                "total_items": result.total_items,
+                "matching_failed": result.matching_failed
+            },
             "uploaded_at": result.uploaded_at.isoformat() if result.uploaded_at else None,
             "confirmed_at": result.confirmed_at.isoformat() if result.confirmed_at else None,
             "confirmed_purchase_id": str(result.confirmed_purchase_id) if result.confirmed_purchase_id else None,

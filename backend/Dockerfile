@@ -25,7 +25,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash app \
+RUN mkdir -p /app/uploads/purchase_bills \
+    && groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash app \
     && chown -R app:app /app
 USER app
 

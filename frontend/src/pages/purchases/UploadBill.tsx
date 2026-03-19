@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -85,11 +85,15 @@ interface PrefillPartyData {
 
 interface ReviewData {
   review_id: string;
-  extraction_confidence: number;
+  extraction_confidence?: number;
   extracted_data?: ExtractionData;
   status?: string;
   error?: string;
   message?: string;
+  error_stage?: string;
+  error_details?: string;
+  file_name?: string;
+  file_size?: number;
   prefill_party?: PrefillPartyData;
   supplier_match?: {
     matched: boolean;
@@ -105,6 +109,7 @@ type UploadState = 'idle' | 'uploading' | 'processing' | 'ready' | 'error';
 const purchaseApi = {
   uploadAndExtract: purchaseService.uploadAndExtract.bind(purchaseService),
   confirmReview: purchaseService.confirmReview.bind(purchaseService),
+  getExtractionReview: purchaseService.getExtractionReview.bind(purchaseService),
   getVendors: purchaseService.getVendors.bind(purchaseService),
 };
 
@@ -141,6 +146,160 @@ export default function UploadBill() {
       }, 300);
     }
   }, [uploadState, extractionResult]);
+
+  const handleReviewResponse = useCallback((data: ReviewData | null | undefined, options?: { fromPolling?: boolean }) => {
+    const fromPolling = options?.fromPolling ?? false;
+
+    console.log('� Review response:', data);
+
+    if (!data) {
+      setUploadState('error');
+      setUploadError('No response from server');
+      toast.error('No response from server');
+      return;
+    }
+
+    if (data.status === 'processing' || data.status === 'pending') {
+      console.log('⏳ Extraction is processing in the background...');
+      setExtractionResult((prev) => ({
+        ...(prev || {}),
+        ...data,
+        review_id: data.review_id || prev?.review_id || ''
+      }));
+      setUploadState('processing');
+      setUploadError(null);
+
+      if (!fromPolling) {
+        toast.info(data.message || 'Upload received. Extraction is running in the background.');
+      }
+      return;
+    }
+
+    if (data.status === 'failed') {
+      const errorMessage = data.error || data.message || 'Failed to extract data from file';
+      const errorDetails = data.error_details || '';
+
+      setUploadState('error');
+      setExtractionResult(data);
+      setUploadError(errorDetails ? `${errorMessage}\n${errorDetails}` : errorMessage);
+
+      toast.error(errorMessage, {
+        description: errorDetails || 'Please try again or enter the purchase bill manually.',
+        duration: 6000
+      });
+      return;
+    }
+
+    if (data.status === 'needs_vendor_review') {
+      console.log('🆕 New vendor found - opening vendor creation modal');
+
+      if (!data.prefill_party) {
+        console.warn('⚠️ needs_vendor_review status but no prefill_party data');
+        setUploadState('error');
+        setUploadError('New vendor detected but no vendor details were extracted.');
+        toast.error('Unable to extract vendor details');
+        return;
+      }
+
+      setExtractionResult(data);
+      setEditedData(JSON.parse(JSON.stringify(data.extracted_data || {})));
+      setNewVendorPrefillData(data.prefill_party);
+      setUploadState('ready');
+      setUploadError(null);
+      setShowNewVendorModal(true);
+      setIsEditing(true);
+
+      const vendorName = data.supplier_match?.candidate_name || data.prefill_party?.party_name || 'Unknown';
+      toast.info(`New vendor found: ${vendorName}`, {
+        description: 'Please review and create the supplier to continue',
+        duration: 5000
+      });
+      return;
+    }
+
+    if (data.status !== 'completed') {
+      console.warn('⚠️ Unexpected status:', data.status);
+      setUploadState('error');
+      setUploadError(`Unexpected response status: ${data.status}`);
+      toast.error('Unexpected response from server');
+      return;
+    }
+
+    if (!data.extracted_data || Object.keys(data.extracted_data).length === 0) {
+      console.warn('⚠️ Status is completed but no extracted data present');
+      setUploadState('error');
+      setUploadError('Extraction completed but no data was extracted. The file may be unreadable or in an unsupported format.');
+      toast.error('No data could be extracted from the file. Please try again or enter manually.');
+      return;
+    }
+
+    console.log('✅ Extraction successful, setting up review UI');
+    console.log('📦 Extracted data keys:', Object.keys(data.extracted_data));
+    console.log('🔍 Review ID:', data.review_id);
+    console.log('📊 Extraction confidence:', data.extraction_confidence);
+    console.log('🎯 Workflow status:', data.status);
+
+    setExtractionResult(data);
+    setEditedData(JSON.parse(JSON.stringify(data.extracted_data)));
+    setUploadState('ready');
+    setUploadError(null);
+    setIsEditing(true);
+
+    const confidence = data.extraction_confidence || 0;
+    toast.success('Extraction complete - Review and save the purchase invoice', {
+      description: `Extracted with ${(confidence * 100).toFixed(1)}% confidence. Please review the details below.`,
+      duration: 6000
+    });
+  }, []);
+
+  useEffect(() => {
+    if (uploadState !== 'processing' || !extractionResult?.review_id) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    const pollExtractionReview = async () => {
+      try {
+        const review = await purchaseApi.getExtractionReview(extractionResult.review_id);
+
+        if (isCancelled) {
+          return;
+        }
+
+        if (review?.status === 'pending' || review?.status === 'processing') {
+          setExtractionResult((prev) => ({
+            ...(prev || {}),
+            ...review,
+            review_id: review.review_id || prev?.review_id || ''
+          }));
+          return;
+        }
+
+        handleReviewResponse(review, { fromPolling: true });
+      } catch (error) {
+        if (isCancelled) {
+          return;
+        }
+
+        console.error('❌ Failed to poll extraction review:', error);
+        setUploadState('error');
+        setUploadError('Upload was received, but Billsage could not fetch the background extraction status. Please try again or enter the bill manually.');
+        toast.error('Could not fetch extraction status', {
+          description: 'The upload was accepted, but the review status could not be loaded.',
+          duration: 5000
+        });
+      }
+    };
+
+    pollExtractionReview();
+    const intervalId = window.setInterval(pollExtractionReview, 3000);
+
+    return () => {
+      isCancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [uploadState, extractionResult?.review_id, handleReviewResponse]);
   
   // Fetch vendors for dropdown
   const { data: vendors = [] } = useQuery({
@@ -152,113 +311,7 @@ export default function UploadBill() {
   const uploadMutation = useMutation({
     mutationFn: purchaseApi.uploadAndExtract,
     onSuccess: (data: any) => {
-      console.log('📥 Upload response:', data);
-      console.log('📊 Response status:', data?.status);
-      console.log('📋 Extracted data present:', !!data?.extracted_data);
-      
-      // Validate response
-      if (!data) {
-        setUploadState('error');
-        setUploadError('No response from server');
-        toast.error('No response from server');
-        return;
-      }
-      
-      // Check for processing status (if backend implements async extraction)
-      if (data.status === 'processing') {
-        console.log('⏳ Extraction is processing...');
-        setUploadState('processing');
-        setUploadError(null);
-        toast.info(data.message || 'Extraction in progress...');
-        // TODO: Implement polling if backend supports async extraction
-        return;
-      }
-      
-      // Check for new vendor workflow
-      if (data.status === 'needs_vendor_review') {
-        console.log('🆕 New vendor found - opening vendor creation modal');
-        console.log('📦 Full upload response:', data);
-        console.log('📋 Prefill party data:', data.prefill_party);
-        
-        // Validate we have prefill data
-        if (!data.prefill_party) {
-          console.warn('⚠️ needs_vendor_review status but no prefill_party data');
-          setUploadState('error');
-          setUploadError('New vendor detected but no vendor details were extracted.');
-          toast.error('Unable to extract vendor details');
-          return;
-        }
-        
-        // Log field mapping for debugging
-        console.log('🔍 Prefill data fields:', {
-          party_name: data.prefill_party.party_name,
-          display_name: data.prefill_party.display_name,
-          gstin: data.prefill_party.gstin,
-          pan: data.prefill_party.pan,
-          email: data.prefill_party.email,
-          phone: data.prefill_party.phone,
-          address: data.prefill_party.address,
-          state: data.prefill_party.state,
-          pin_code: data.prefill_party.pin_code,
-          website: data.prefill_party.website,
-          notes: data.prefill_party.notes
-        });
-        
-        // Set extraction result and show vendor modal
-        setExtractionResult(data);
-        setEditedData(JSON.parse(JSON.stringify(data.extracted_data || {}))); // Deep copy
-        setNewVendorPrefillData(data.prefill_party);
-        setUploadState('ready');
-        setUploadError(null);
-        setShowNewVendorModal(true);
-        
-        const vendorName = data.supplier_match?.candidate_name || data.prefill_party?.party_name || 'Unknown';
-        toast.info(`New vendor found: ${vendorName}`, {
-          description: 'Please review and create the supplier to continue',
-          duration: 5000
-        });
-        return;
-      }
-      
-      // Status should be "completed" at this point for successful extraction
-      if (data.status !== 'completed') {
-        console.warn('⚠️ Unexpected status:', data.status);
-        setUploadState('error');
-        setUploadError(`Unexpected response status: ${data.status}`);
-        toast.error('Unexpected response from server');
-        return;
-      }
-      
-      // Check if we have extracted data
-      if (!data.extracted_data || Object.keys(data.extracted_data).length === 0) {
-        console.warn('⚠️ Status is completed but no extracted data present');
-        setUploadState('error');
-        setUploadError('Extraction completed but no data was extracted. The file may be unreadable or in an unsupported format.');
-        toast.error('No data could be extracted from the file. Please try again or enter manually.');
-        return;
-      }
-      
-      // Success - we have valid extracted data
-      console.log('✅ Extraction successful, setting up review UI');
-      console.log('📦 Extracted data keys:', Object.keys(data.extracted_data));
-      console.log('🔍 Review ID:', data.review_id);
-      console.log('📊 Extraction confidence:', data.extraction_confidence);
-      console.log('🎯 Workflow status:', data.status);
-      
-      setExtractionResult(data);
-      setEditedData(JSON.parse(JSON.stringify(data.extracted_data))); // Deep copy
-      setUploadState('ready');
-      setUploadError(null);
-      
-      // Automatically enable editing mode for review
-      setIsEditing(true);
-      console.log('✏️ Auto-enabled editing mode for review');
-      
-      const confidence = data.extraction_confidence || 0;
-      toast.success('Extraction complete - Review and save the purchase invoice', {
-        description: `Extracted with ${(confidence * 100).toFixed(1)}% confidence. Please review the details below.`,
-        duration: 6000
-      });
+      handleReviewResponse(data);
     },
     onError: (error: any) => {
       console.error('❌ Upload error:', error);
@@ -267,9 +320,20 @@ export default function UploadBill() {
       let errorMessage = 'Failed to upload or extract data from file';
       let errorDetails = '';
       let errorStage = 'unknown';
+      const structuredDetail = error?.details?.detail;
       
       // Check if error has response data (from API)
-      if (error.response?.data) {
+      if (structuredDetail && typeof structuredDetail === 'object') {
+        const errorData = structuredDetail;
+        errorStage = errorData.stage || 'unknown';
+        errorMessage = errorData.message || errorMessage;
+        errorDetails = errorData.details || '';
+
+        console.error(`❌ Error at stage '${errorStage}':`, errorMessage);
+        if (errorDetails) {
+          console.error('   Details:', errorDetails);
+        }
+      } else if (error.response?.data) {
         const errorData = error.response.data;
         errorStage = errorData.stage || 'unknown';
         errorMessage = errorData.message || errorMessage;
@@ -281,6 +345,10 @@ export default function UploadBill() {
         }
       } else if (error.message) {
         errorMessage = error.message;
+        if (error.status === 524) {
+          errorMessage = 'Upload timed out before the server responded';
+          errorDetails = 'Billsage will now process uploads in the background after redeploy. Please retry once the latest fix is live.';
+        }
       }
       
       // Set error state
@@ -348,6 +416,10 @@ export default function UploadBill() {
     }
     
     setSelectedFile(file);
+    setCreatedSupplierId(null);
+    setShowNewVendorModal(false);
+    setIsEditing(false);
+    setUploadError(null);
     setExtractionResult(null);
     setEditedData(null);
   };
@@ -365,6 +437,9 @@ export default function UploadBill() {
     setUploadError(null);
     setExtractionResult(null);
     setEditedData(null);
+    setCreatedSupplierId(null);
+    setShowNewVendorModal(false);
+    setIsEditing(false);
   };
   
   const handleEdit = () => {
@@ -576,18 +651,27 @@ export default function UploadBill() {
       )}
       
       {/* Upload Progress */}
-      {uploadState === 'uploading' && (
+      {(uploadState === 'uploading' || uploadState === 'processing') && (
         <Card>
           <div className="p-6">
             <div className="space-y-4">
               <div className="flex items-center space-x-2">
                 <Loader2 className="h-5 w-5 animate-spin text-primary" />
-                <span className="font-medium">Processing PDF...</span>
+                <span className="font-medium">
+                  {uploadState === 'uploading' ? 'Uploading PDF...' : 'Extraction running in background...'}
+                </span>
               </div>
-              <Progress value={66} className="w-full" />
+              <Progress value={uploadState === 'uploading' ? 35 : 80} className="w-full" />
               <p className="text-sm text-muted-foreground">
-                Extracting text and analyzing invoice data...
+                {uploadState === 'uploading'
+                  ? 'Sending the purchase bill to Billsage...'
+                  : (extractionResult?.message || 'We received your file. OCR and invoice extraction are running in the background.')}
               </p>
+              {uploadState === 'processing' && extractionResult?.review_id && (
+                <p className="text-xs text-muted-foreground">
+                  Review ID: {extractionResult.review_id}
+                </p>
+              )}
             </div>
           </div>
         </Card>

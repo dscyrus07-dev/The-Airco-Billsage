@@ -234,7 +234,7 @@ export default function RecordPayment({ open, onOpenChange, vendor, onSuccess }:
                     value={watchedPaymentMode}
                     onValueChange={(value) => form.setValue('paymentMode', value as any)}
                   >
-                    <SelectTrigger>
+                    <SelectTrigger id="paymentMode">
                       <SelectValue placeholder="Select payment mode" />
                     </SelectTrigger>
                     <SelectContent>

@@ -6,6 +6,7 @@ All operations use real PostgreSQL database (vouchers table).
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -898,7 +899,7 @@ async def download_sale_invoice(
     """Download sales invoice export as JSON attachment."""
     sale = await get_sale(sale_id, current_user, db)
     return JSONResponse(
-        content=sale,
+        content=jsonable_encoder(sale),
         headers={
             "Content-Disposition": f'attachment; filename="sale-{sale_id}.json"'
         },

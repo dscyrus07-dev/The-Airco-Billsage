@@ -43,6 +43,8 @@ fi
 
 cd "$APP_DIR"
 mkdir -p backend/uploads/purchase_bills
+chown -R 1000:1000 backend/uploads
+chmod -R u+rwX,go+rX backend/uploads
 
 if [ -f "$GATEWAY_CONF_DIR/$GATEWAY_CONF_FILE" ]; then
   cp "$GATEWAY_CONF_DIR/$GATEWAY_CONF_FILE" "$BACKUP_DIR/billsage.gateway.$TIMESTAMP.conf"
