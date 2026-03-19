@@ -47,4 +47,5 @@ services:
 
 networks:
   billsage_network:
+    name: airco-billsage_billsage_network
     driver: bridge

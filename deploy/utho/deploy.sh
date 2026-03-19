@@ -6,11 +6,11 @@ REPO_URL="${REPO_URL:-https://github.com/dscyrus07-dev/The-Airco-Billsage.git}"
 BRANCH="${BRANCH:-main}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.utho.yml}"
 PROJECT_NAME="${PROJECT_NAME:-airco-billsage}"
-NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/billsage.theairco.ai}"
-NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled/billsage.theairco.ai}"
+GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-nginx-gateway}"
+GATEWAY_CONF_DIR="${GATEWAY_CONF_DIR:-/opt/nginx-gateway/nginx/conf.d}"
+GATEWAY_CONF_FILE="${GATEWAY_CONF_FILE:-billsage.conf}"
+GATEWAY_NETWORK="${GATEWAY_NETWORK:-airco-billsage_billsage_network}"
 NGINX_TEMPLATE_REL="deploy/utho/nginx/billsage.theairco.ai.conf"
-SSL_CERT_PATH="${SSL_CERT_PATH:-/etc/nginx/ssl/origin.pem}"
-SSL_KEY_PATH="${SSL_KEY_PATH:-/etc/nginx/ssl/origin-key.pem}"
 BACKUP_DIR="${BACKUP_DIR:-/root/airco-billsage-backups}"
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-https://billsage.theairco.ai}"
 VITE_SUPABASE_URL="${VITE_SUPABASE_URL:-https://lqliskmaiyemyramntyp.supabase.co}"
@@ -44,22 +44,8 @@ fi
 cd "$APP_DIR"
 mkdir -p backend/uploads/purchase_bills
 
-if [ -f "$NGINX_SITE" ]; then
-  cp "$NGINX_SITE" "$BACKUP_DIR/billsage.theairco.ai.$TIMESTAMP.conf"
-fi
-
-if [ ! -f "$SSL_CERT_PATH" ] || [ ! -f "$SSL_KEY_PATH" ]; then
-  DETECTED_CERT_PATH="$(grep -R "ssl_certificate[[:space:]]" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | grep -v "ssl_certificate_key" | head -n 1 | awk '{print $2}' | sed 's/;$//')"
-  DETECTED_KEY_PATH="$(grep -R "ssl_certificate_key[[:space:]]" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | head -n 1 | awk '{print $2}' | sed 's/;$//')"
-  if [ -n "$DETECTED_CERT_PATH" ] && [ -n "$DETECTED_KEY_PATH" ]; then
-    SSL_CERT_PATH="$DETECTED_CERT_PATH"
-    SSL_KEY_PATH="$DETECTED_KEY_PATH"
-  fi
-fi
-
-if [ ! -f "$SSL_CERT_PATH" ] || [ ! -f "$SSL_KEY_PATH" ]; then
-  echo "SSL files not found"
-  exit 1
+if [ -f "$GATEWAY_CONF_DIR/$GATEWAY_CONF_FILE" ]; then
+  cp "$GATEWAY_CONF_DIR/$GATEWAY_CONF_FILE" "$BACKUP_DIR/billsage.gateway.$TIMESTAMP.conf"
 fi
 
 $COMPOSE_BIN -p "$PROJECT_NAME" -f "$COMPOSE_FILE" down || true
@@ -83,15 +69,12 @@ done
 curl -fsS http://127.0.0.1:8100/health >/dev/null
 curl -IfsS http://127.0.0.1:3100 >/dev/null
 
-sed \
-  -e "s|__SSL_CERT_PATH__|$SSL_CERT_PATH|g" \
-  -e "s|__SSL_KEY_PATH__|$SSL_KEY_PATH|g" \
-  "$APP_DIR/$NGINX_TEMPLATE_REL" > "$NGINX_SITE"
+docker network connect "$GATEWAY_NETWORK" "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+cp "$APP_DIR/$NGINX_TEMPLATE_REL" "$GATEWAY_CONF_DIR/$GATEWAY_CONF_FILE"
+docker exec "$GATEWAY_CONTAINER" nginx -t
+docker exec "$GATEWAY_CONTAINER" nginx -s reload
 
-ln -sfn "$NGINX_SITE" "$NGINX_ENABLED"
-nginx -t
-systemctl reload nginx
-
+curl -kIfsS --resolve billsage.theairco.ai:443:127.0.0.1 https://billsage.theairco.ai >/dev/null
 curl -IfsS https://billsage.theairco.ai >/dev/null
 curl -fsS https://billsage.theairco.ai/health >/dev/null
 
