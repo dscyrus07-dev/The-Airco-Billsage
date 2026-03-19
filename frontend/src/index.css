@@ -1,0 +1,109 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=DM+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 20% 98%;
+    --foreground: 220 15% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 220 15% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 15% 12%;
+
+    --primary: 173 58% 39%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 40 12% 94%;
+    --secondary-foreground: 220 15% 20%;
+
+    --muted: 40 10% 93%;
+    --muted-foreground: 220 8% 46%;
+
+    --accent: 173 25% 93%;
+    --accent-foreground: 173 58% 28%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 60% 40%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 38 92% 14%;
+
+    --info: 210 60% 50%;
+    --info-foreground: 0 0% 100%;
+
+    --border: 40 12% 90%;
+    --input: 40 12% 88%;
+    --ring: 173 58% 39%;
+
+    --radius: 0.5rem;
+
+    --sidebar-background: 220 15% 8%;
+    --sidebar-foreground: 220 10% 70%;
+    --sidebar-primary: 173 58% 50%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 15% 14%;
+    --sidebar-accent-foreground: 220 10% 85%;
+    --sidebar-border: 220 15% 16%;
+    --sidebar-ring: 173 58% 39%;
+    --sidebar-muted: 220 10% 40%;
+
+    --chart-1: 173 58% 39%;
+    --chart-2: 38 92% 50%;
+    --chart-3: 210 60% 50%;
+    --chart-4: 152 60% 40%;
+    --chart-5: 0 72% 51%;
+
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  .dark {
+    --background: 220 15% 8%;
+    --foreground: 220 10% 90%;
+    --card: 220 15% 11%;
+    --card-foreground: 220 10% 90%;
+    --popover: 220 15% 11%;
+    --popover-foreground: 220 10% 90%;
+    --primary: 173 58% 50%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 15% 16%;
+    --secondary-foreground: 220 10% 85%;
+    --muted: 220 12% 18%;
+    --muted-foreground: 220 10% 55%;
+    --accent: 173 25% 18%;
+    --accent-foreground: 173 58% 60%;
+    --destructive: 0 62% 30%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 15% 18%;
+    --input: 220 15% 18%;
+    --ring: 173 58% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  /* Tabular numbers for financial data */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}

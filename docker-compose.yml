@@ -1,0 +1,58 @@
+services:
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: billsage-backend
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://postgres.lqliskmaiyemyramntyp:bsk9820658944@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres
+      DB_HOST: aws-1-ap-southeast-1.pooler.supabase.com
+      DB_PORT: 6543
+      DB_NAME: postgres
+      DB_USER: postgres.lqliskmaiyemyramntyp
+      DB_PASSWORD: bsk9820658944
+      APP_NAME: BillSage Backend
+      APP_VERSION: 1.0.0
+      DEBUG: false
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: http://localhost:3000,http://localhost:80,http://frontend:80
+    ports:
+      - "8000:8000"
+    networks:
+      - billsage-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    volumes:
+      - ./backend/uploads:/app/uploads
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: billsage-frontend
+    env_file:
+      - ./frontend/.env
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+      VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-https://lqliskmaiyemyramntyp.supabase.co}
+      VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
+    ports:
+      - "3000:80"
+    networks:
+      - billsage-network
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+networks:
+  billsage-network:
+    driver: bridge
